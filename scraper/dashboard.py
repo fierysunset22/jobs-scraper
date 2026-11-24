@@ -24,6 +24,7 @@ from pathlib import Path
 
 from scraper import prefs as prefs_store
 from scraper import store
+from scraper.filters import work_arrangement
 
 
 def _slug(company: str) -> str:
@@ -72,7 +73,7 @@ def collect(data_dir: Path, config: dict) -> dict:
         meta[_slug(c["company"])] = {"name": c["company"],
                                      "domain": c.get("domain", "")}
 
-    # Jobs discovered on today's run → drives "New Today" + the NEW badge.
+    # Jobs first seen on today's run → drives "New Today" + the NEW badge.
     events_raw = store.load_events(data_dir)
     new_ids_today = {e["id"] for e in events_raw if e.get("date") == today_str}
 
@@ -80,6 +81,7 @@ def collect(data_dir: Path, config: dict) -> dict:
     companies = []
     jobs = []
     remote_count = 0
+    new_count = 0
     if state_dir.exists():
         for path in sorted(state_dir.glob("*.json")):
             info = meta.get(path.stem, {"name": path.stem.replace("-", " ").title(),
@@ -92,15 +94,21 @@ def collect(data_dir: Path, config: dict) -> dict:
                 loc = r.get("location", "")
                 if _is_remote(loc):
                     remote_count += 1
+
+                first_seen = r.get("first_seen") or ""
+                is_new = bool(first_seen == today_str or r.get("id", "") in new_ids_today)
+                if is_new:
+                    new_count += 1
                 jobs.append({
                     "id": r.get("id", ""),
                     "company": info["name"],
                     "domain": info["domain"],
                     "title": r.get("title", ""),
                     "location": loc,
+                    "work_type": work_arrangement(loc, r.get("description", "")),
                     "url": r.get("url", ""),
                     "remote": _is_remote(loc),
-                    "isNew": r.get("id", "") in new_ids_today,
+                    "isNew": is_new,
                     "updated": _relative(r.get("updated_at", ""), today),
                 })
 
@@ -121,21 +129,14 @@ def collect(data_dir: Path, config: dict) -> dict:
         "companies": sorted(companies, key=lambda c: c["company"]),
         "jobs": jobs,
         "total_jobs": len(jobs),
-        "new_count": len(new_ids_today),
+        "new_count": new_count,
         "remote_count": remote_count,
+        # Active filters applied during fetch
+        "filters": config.get("filters", {}),
         # Followed / dismissed roles, embedded so the page renders correctly on
         # first paint (over HTTP the dashboard then reconciles via /api/prefs).
         "prefs": prefs_store.load_prefs(data_dir),
     }
-
-
-def _escape_for_script(s: str) -> str:
-    return s.replace("</", "<\\/")
-
-
-def render(data: dict) -> str:
-    payload = json.dumps(data, ensure_ascii=False)
-    return _TEMPLATE.replace("__PAYLOAD__", _escape_for_script(payload))
 
 
 def _load_config(config_path: Path) -> dict:
@@ -146,11 +147,30 @@ def _load_config(config_path: Path) -> dict:
 
 
 def build_dashboard(data_dir: Path, out_path: Path,
-                    config_path: Path | None = None) -> Path:
-    config = _load_config(config_path) if config_path else {}
-    data = collect(data_dir, config)
-    out_path.write_text(render(data), encoding="utf-8")
-    return out_path
+                    config_path: Path | None = None,
+                    config: dict | None = None) -> Path:
+  config = config if config is not None else (_load_config(config_path) if config_path else {})
+  data = collect(data_dir, config)
+  # Write only the machine-readable per-run payload. Static assets live in
+  # the dashboard directory and are managed separately (not rewritten).
+  out_dir = out_path.parent
+  out_dir.mkdir(parents=True, exist_ok=True)
+  data_path = out_dir / "data.json"
+  data_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+  # Ensure a minimal index.html exists on first run for backwards
+  # compatibility; otherwise leave static files untouched.
+  idx = out_dir / "index.html"
+  if not idx.exists():
+    idx.write_text(
+      """<!doctype html>
+<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>Job Tracker</title>\n<link rel=\"stylesheet\" href=\"/dashboard/styles.css\">\n</head>\n<body>\n<div id=\"app\">Loading…</div>\n<script>/* data loaded from data.json */</script>\n<script src=\"/dashboard/app.js\" defer></script>\n</body>\n</html>""",
+      encoding="utf-8")
+  return data_path
+
+
+# The large single-file HTML template and embedded JS/CSS have been removed.
+# Static files now live under the `dashboard/` directory and a per-run
+# `data.json` is written by `build_dashboard()`.
 
 
 _TEMPLATE = r"""<!DOCTYPE html>
@@ -412,7 +432,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div class="selwrap">
         <select id="loc">
-          <option value="all">All Locations</option>
+          <option value="all">All</option>
           <option value="remote">Remote</option>
           <option value="onsite">On-site</option>
         </select>
@@ -731,9 +751,9 @@ initPrefs();
 
 
 if __name__ == "__main__":
-    root = Path(__file__).resolve().parent.parent
-    from scraper.env import load_env
-    load_env(root / ".env")
-    out = build_dashboard(root / "data", root / "dashboard.html",
-                          root / "config.json")
-    print(f"dashboard written to {out}")
+        root = Path(__file__).resolve().parent.parent
+        from scraper.env import load_env
+        load_env(root / ".env")
+        out = build_dashboard(root / "data", root / "dashboard" / "index.html",
+                                                    root / "config.json")
+        print(f"dashboard written to {out}")

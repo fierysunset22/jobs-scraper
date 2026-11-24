@@ -2,7 +2,8 @@
 
 Two independent filters, both driven by config.json's ``filters`` block:
 
-  * us_only   — keep only roles located in the United States
+    * us_only   — keep only roles located in the United States
+    * work_arrangement — keep roles matching any, remote, hybrid, or onsite
   * keywords  — keep only roles whose title matches one of the keywords
 
 Location strings are wildly inconsistent across ATSes ("USA - Remote",
@@ -97,6 +98,25 @@ def _compile_keywords(keywords: list[str]) -> re.Pattern | None:
     return re.compile(r"\b(?:" + alts + r")\b", re.I)
 
 
+def work_arrangement(location: str, description: str = "") -> str:
+    """Classify from keywords anywhere in the location or description."""
+    value = f"{location or ''} {description or ''}".lower()
+    # A specific recurring office schedule means the role is hybrid, even if
+    # the description does not include Ashby's separate "Location Type" field.
+    days_per_week = r"(?:[1-5]|one|two|three|four|five)\s+days?\s+(?:(?:a|per)\s+week|/week)"
+    office = r"(?:in[- ]office|on[- ]?site|at (?:the )?office)"
+    if (re.search(rf"\b{office}\b.{{0,40}}\b{days_per_week}\b", value)
+            or re.search(rf"\b{days_per_week}\b.{{0,40}}\b{office}\b", value)):
+        return "hybrid"
+    if re.search(r"\bremote\b", value):
+        return "remote"
+    if re.search(r"\bhybrid\b", value):
+        return "hybrid"
+    if re.search(r"\b(?:on[- ]?site|in[- ]office|office[- ]based)\b", value):
+        return "onsite"
+    return "unknown"
+
+
 def make_filter(filters: dict | None):
     """Return a predicate ``job -> bool`` for the configured filters.
 
@@ -104,21 +124,22 @@ def make_filter(filters: dict | None):
     """
     filters = filters or {}
     us_only = filters.get("us_only", False)
-    include_remote = filters.get("include_unspecified_remote", False)
+    arrangement = filters.get("work_arrangement", "any")
+    if arrangement not in {"any", "remote", "hybrid", "onsite"}:
+        arrangement = "any"
     kw = _compile_keywords(filters.get("keywords", []))
 
     def keep(job: dict) -> bool:
         if kw is not None and not kw.search(job.get("title", "")):
+            return False
+        loc = job.get("location", "")
+        if arrangement != "any" and work_arrangement(loc, job.get("description", "")) != arrangement:
             return False
         if us_only:
             # Office/region tags (Greenhouse) are the most reliable US signal and
             # resolve cases the free-text location can't, like "N/A".
             if any(is_us(o) for o in job.get("offices", [])):
                 return True
-            loc = job.get("location", "")
-            bare_remote = loc.strip().lower() in ("remote", "", "n/a")
-            if bare_remote:
-                return include_remote
             if not is_us(loc):
                 return False
         return True
